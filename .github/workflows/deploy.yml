@@ -1,0 +1,102 @@
+name: Deploy Pages
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: Mahavir00/kismatconnection-src
+          ssh-key: ${{ secrets.SRC_DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build site
+        shell: bash
+        run: |
+          if [[ -f src/package.json ]]; then
+            if ! (cd src && npm ci >"$RUNNER_TEMP/npm-ci.log" 2>&1); then
+              echo "Dependency installation failed." >&2
+              exit 1
+            fi
+            if ! (cd src && npm run build >"$RUNNER_TEMP/npm-build.log" 2>&1); then
+              echo "Site build failed." >&2
+              exit 1
+            fi
+          else
+            rm -rf src/dist
+            cp -a src/site src/dist
+          fi
+
+      - name: Package Pages artifact
+        shell: bash
+        run: tar --dereference --hard-dereference --directory src/dist -cf "$RUNNER_TEMP/artifact.tar" --exclude=.git --exclude=.github .
+
+      - name: Upload Pages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  cleanup:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete run artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          ids="$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts?per_page=100" --paginate --jq '.artifacts[].id' 2>/dev/null)" || {
+            printf 'Artifacts found: 0; deleted: 0; failed: 1\n'
+            exit 1
+          }
+          found=0
+          deleted=0
+          failed=0
+          while IFS= read -r artifact_id; do
+            [[ -z "$artifact_id" ]] && continue
+            found=$((found + 1))
+            if gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$artifact_id" >/dev/null 2>&1; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+            fi
+          done <<< "$ids"
+          printf 'Artifacts found: %s; deleted: %s; failed: %s\n' "$found" "$deleted" "$failed"
+          [[ "$failed" -eq 0 ]]
